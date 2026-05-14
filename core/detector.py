@@ -142,13 +142,14 @@ def detect_file_lock(filepath: str):
         ret = RmGetList(session_handle, ctypes.byref(proc_needed), ctypes.byref(proc_count), None, ctypes.byref(reboot_reasons))
         if ret == ERROR_MORE_DATA and proc_needed.value > 0:
             proc_info_array = (RM_PROCESS_INFO * proc_needed.value)()
-            proc_count = proc_needed
-            ret = RmGetList(session_handle, ctypes.byref(proc_needed), ctypes.byref(proc_count), proc_info_array, ctypes.byref(reboot_reasons))
+            # 使用独立的 UINT，避免 pnProcInfoNeeded 和 pnProcInfo 指向同一地址
+            proc_count2 = UINT(proc_needed.value)
+            ret = RmGetList(session_handle, ctypes.byref(proc_needed), ctypes.byref(proc_count2), proc_info_array, ctypes.byref(reboot_reasons))
             if ret != ERROR_SUCCESS:
                 return []
 
             results = []
-            for i in range(proc_count.value):
+            for i in range(proc_count2.value):
                 info = proc_info_array[i]
                 pid = info.Process.dwProcessId
                 name = info.strAppName

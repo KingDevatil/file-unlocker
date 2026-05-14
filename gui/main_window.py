@@ -87,12 +87,20 @@ class MainWindow:
         self._scan_thread = None
         self._pending_scan_paths = []
 
+        # 线程安全 UI 更新队列（后台线程放，主线程取）
+        self._ui_queue = queue.Queue()
+
         # 存储当前选中的检测结果 {行id: filepath}
         self._row_file_map = {}
+
+        # 生命周期标志
+        self._destroyed = False
 
         self._build_ui()
         self._setup_drag_drop()
         self._start_queue_polling()
+        self._start_ui_polling()
+        self.root.bind("<Destroy>", self._on_destroy)
 
     def _build_ui(self):
         # 顶部区域：说明 + 按钮
@@ -191,22 +199,21 @@ class MainWindow:
             self._start_folder_scan(folders)
 
     def _detect_files(self, file_paths):
-        """对单个/多个文件执行占用检测，并更新 UI"""
-        self.status_var.set(f"正在检测 {len(file_paths)} 个文件...")
-        self.root.update_idletasks()
+        """对单个/多个文件执行占用检测，并更新 UI（后台线程执行，不阻塞 GUI）"""
+        self._ui_queue.put(("status", f"正在检测 {len(file_paths)} 个文件..."))
+        total = len(file_paths)
 
-        for fp in file_paths:
-            procs = detect_file_lock(fp)
-            if procs:
-                for proc in procs:
-                    iid = self.tree.insert("", tk.END, values=(fp, proc["name"], proc["pid"], proc["path"]))
-                    self._row_file_map[iid] = fp
-            else:
-                # 未检测到占用，也插入一行提示
-                iid = self.tree.insert("", tk.END, values=(fp, "(未检测到占用)", "", ""))
-                self._row_file_map[iid] = fp
+        def worker():
+            for idx, fp in enumerate(file_paths, 1):
+                try:
+                    procs = detect_file_lock(fp)
+                except Exception as exc:
+                    self._ui_queue.put(("insert", fp, None, str(exc), f"检测完成 {idx}/{total}"))
+                    continue
+                self._ui_queue.put(("insert", fp, procs, None, f"检测完成 {idx}/{total}"))
+            self._ui_queue.put(("status", "检测完成"))
 
-        self.status_var.set("检测完成")
+        threading.Thread(target=worker, daemon=True).start()
 
     def _start_folder_scan(self, folders):
         """启动后台线程扫描文件夹"""
@@ -229,37 +236,83 @@ class MainWindow:
         self._scan_thread.start()
 
     def _start_queue_polling(self):
-        """定时轮询扫描队列，将后台发现的文件交给检测模块"""
+        """定时轮询扫描队列，将后台发现的文件交给检测模块（不阻塞 GUI）"""
         def poll():
-            processed = 0
+            if self._destroyed:
+                return
             try:
-                while True:
-                    item = self._scan_queue.get_nowait()
-                    msg_type, data = item
-                    if msg_type == "file":
-                        # 检测单个文件
-                        procs = detect_file_lock(data)
-                        if procs:
-                            for proc in procs:
-                                iid = self.tree.insert("", tk.END, values=(data, proc["name"], proc["pid"], proc["path"]))
-                                self._row_file_map[iid] = data
-                        else:
-                            iid = self.tree.insert("", tk.END, values=(data, "(未检测到占用)", "", ""))
-                            self._row_file_map[iid] = data
-                        processed += 1
-                    elif msg_type == "error":
-                        messagebox.showerror("扫描错误", f"扫描过程中出错：{data}")
-                    elif msg_type == "done":
-                        self.status_var.set("扫描完成")
+                item = self._scan_queue.get_nowait()
+                msg_type, data = item
+                if msg_type == "file":
+                    # 在后台线程中检测单个文件，通过 _ui_queue 回传结果
+                    def worker(path=data):
+                        try:
+                            procs = detect_file_lock(path)
+                        except Exception as exc:
+                            self._ui_queue.put(("insert", path, None, str(exc), "扫描中..."))
+                            return
+                        self._ui_queue.put(("insert", path, procs, None, "扫描中..."))
+
+                    threading.Thread(target=worker, daemon=True).start()
+                elif msg_type == "error":
+                    messagebox.showerror("扫描错误", f"扫描过程中出错：{data}")
+                elif msg_type == "done":
+                    self._ui_queue.put(("status", "扫描完成"))
             except queue.Empty:
                 pass
 
-            if processed > 0:
-                self.status_var.set(f"已扫描并检测 {processed} 个文件")
-
-            self.root.after(200, poll)
+            try:
+                self.root.after(200, poll)
+            except tk.TclError:
+                pass
 
         self.root.after(200, poll)
+
+    def _on_destroy(self, event):
+        """窗口销毁时停止轮询并恢复原始窗口过程"""
+        if event.widget is self.root:
+            self._destroyed = True
+            try:
+                if self._old_wndproc is not None:
+                    _SetWindowLong(self.root.winfo_id(), GWL_WNDPROC, ctypes.cast(self._old_wndproc, _WPARAM_PTR).value)
+            except Exception:
+                pass
+
+    def _start_ui_polling(self):
+        """主线程轮询 UI 更新队列，将后台线程的结果同步到界面"""
+        def poll():
+            if self._destroyed:
+                return
+            try:
+                while True:
+                    item = self._ui_queue.get_nowait()
+                    msg_type = item[0]
+                    if msg_type == "insert":
+                        _, path, procs, err, status_text = item
+                        if err:
+                            iid = self.tree.insert("", tk.END, values=(path, f"(检测出错: {err})", "", ""))
+                            self._row_file_map[iid] = path
+                        elif procs:
+                            for proc in procs:
+                                iid = self.tree.insert("", tk.END, values=(path, proc["name"], proc["pid"], proc["path"]))
+                                self._row_file_map[iid] = path
+                        else:
+                            iid = self.tree.insert("", tk.END, values=(path, "(未检测到占用)", "", ""))
+                            self._row_file_map[iid] = path
+                        self.status_var.set(status_text)
+                    elif msg_type == "status":
+                        self.status_var.set(item[1])
+                    elif msg_type == "terminate_done":
+                        _, success, failed = item
+                        self._show_terminate_result(success, failed)
+            except queue.Empty:
+                pass
+            try:
+                self.root.after(100, poll)
+            except tk.TclError:
+                pass
+
+        self.root.after(100, poll)
 
     def _on_select_file(self):
         from tkinter import filedialog
@@ -284,7 +337,7 @@ class MainWindow:
             self.status_var.set("列表为空，无可刷新内容")
 
     def _on_terminate_selected(self):
-        """终止选中行对应的进程"""
+        """终止选中行对应的进程（后台线程执行，不阻塞 GUI）"""
         selected = self.tree.selection()
         if not selected:
             messagebox.showwarning("提示", "请先选中要终止的进程行")
@@ -307,22 +360,33 @@ class MainWindow:
         if not answer:
             return
 
-        success = []
-        failed = []
-        for pid in pids_to_kill:
-            if terminate_process(pid):
-                success.append(pid)
-            else:
-                failed.append(pid)
+        self._ui_queue.put(("status", "正在终止进程..."))
 
+        def worker():
+            success = []
+            failed = []
+            for pid in pids_to_kill:
+                try:
+                    if terminate_process(pid):
+                        success.append(pid)
+                    else:
+                        failed.append(pid)
+                except Exception:
+                    failed.append(pid)
+
+            self._ui_queue.put(("terminate_done", success, failed))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_terminate_result(self, success, failed):
+        """在主线程中显示终止结果并自动刷新"""
         msg = ""
         if success:
             msg += f"成功终止：{success}\n"
         if failed:
             msg += f"终止失败：{failed}"
-        messagebox.showinfo("结果", msg)
-
-        # 自动刷新
+        if msg:
+            messagebox.showinfo("结果", msg)
         self._on_refresh()
 
     def _on_clear(self):
