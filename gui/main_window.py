@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import queue
+import traceback
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 
@@ -61,17 +62,21 @@ _GetWindowLong.restype = _WPARAM_PTR
 
 def _handle_drop_files(hwnd, wparam):
     """解析 WM_DROPFILES 的拖拽路径列表"""
-    hdrop = wparam
-    file_count = DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
-    paths = []
-    for i in range(file_count):
-        length = DragQueryFileW(hdrop, i, None, 0)
-        if length > 0:
-            buf = ctypes.create_unicode_buffer(length + 1)
-            DragQueryFileW(hdrop, i, buf, length + 1)
-            paths.append(buf.value)
-    DragFinish(hdrop)
-    return paths
+    try:
+        hdrop = wparam
+        file_count = DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+        paths = []
+        for i in range(file_count):
+            length = DragQueryFileW(hdrop, i, None, 0)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                DragQueryFileW(hdrop, i, buf, length + 1)
+                paths.append(buf.value)
+        DragFinish(hdrop)
+        return paths
+    except Exception:
+        traceback.print_exc()
+        return []
 
 
 class MainWindow:
@@ -170,12 +175,17 @@ class MainWindow:
         # 创建新的窗口过程回调
         @ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
         def new_wndproc(hwnd, msg, wparam, lparam):
-            if msg == WM_DROPFILES:
-                paths = _handle_drop_files(hwnd, wparam)
-                if paths:
-                    self._handle_paths(paths)
+            try:
+                if msg == WM_DROPFILES:
+                    paths = _handle_drop_files(hwnd, wparam)
+                    if paths:
+                        self._handle_paths(paths)
+                    return 0
+                return CallWindowProcW(self._old_wndproc, hwnd, msg, wparam, lparam)
+            except Exception:
+                # ctypes 回调内发生未捕获异常会导致进程直接崩溃，必须捕获
+                traceback.print_exc()
                 return 0
-            return CallWindowProcW(self._old_wndproc, hwnd, msg, wparam, lparam)
 
         self._py_wndproc = new_wndproc
         self._old_wndproc = _GetWindowLong(self.root.winfo_id(), GWL_WNDPROC)
@@ -183,20 +193,22 @@ class MainWindow:
 
     def _handle_paths(self, paths):
         """处理传入的路径列表（文件或文件夹）"""
-        files = []
-        folders = []
-        for p in paths:
-            if os.path.isfile(p):
-                files.append(p)
-            elif os.path.isdir(p):
-                folders.append(p)
+        try:
+            files = []
+            folders = []
+            for p in paths:
+                if os.path.isfile(p):
+                    files.append(p)
+                elif os.path.isdir(p):
+                    folders.append(p)
 
-        if files:
-            self._detect_files(files)
+            if files:
+                self._detect_files(files)
 
-        if folders:
-            # 批量扫描文件夹
-            self._start_folder_scan(folders)
+            if folders:
+                self._start_folder_scan(folders)
+        except Exception:
+            traceback.print_exc()
 
     def _detect_files(self, file_paths):
         """对单个/多个文件执行占用检测，并更新 UI（后台线程执行，不阻塞 GUI）"""
@@ -208,6 +220,7 @@ class MainWindow:
                 try:
                     procs = detect_file_lock(fp)
                 except Exception as exc:
+                    traceback.print_exc()
                     self._ui_queue.put(("insert", fp, None, str(exc), f"检测完成 {idx}/{total}"))
                     continue
                 self._ui_queue.put(("insert", fp, procs, None, f"检测完成 {idx}/{total}"))

@@ -6,6 +6,7 @@
 import ctypes
 import ctypes.wintypes
 from ctypes import wintypes
+import traceback
 import os
 
 
@@ -26,7 +27,8 @@ ERROR_SUCCESS = 0
 ERROR_MORE_DATA = 234
 CCH_RM_MAX_APP_NAME = 255
 CCH_RM_MAX_SVC_NAME = 63
-RM_SESSION_KEY_LEN = 16
+# CCH_RM_SESSION_KEY = 32 (定义于 restartmanager.h)，需额外 +1 容纳终止空字符
+RM_SESSION_KEY_LEN = 32
 
 
 class RM_UNIQUE_PROCESS(ctypes.Structure):
@@ -142,7 +144,6 @@ def detect_file_lock(filepath: str):
         ret = RmGetList(session_handle, ctypes.byref(proc_needed), ctypes.byref(proc_count), None, ctypes.byref(reboot_reasons))
         if ret == ERROR_MORE_DATA and proc_needed.value > 0:
             proc_info_array = (RM_PROCESS_INFO * proc_needed.value)()
-            # 使用独立的 UINT，避免 pnProcInfoNeeded 和 pnProcInfo 指向同一地址
             proc_count2 = UINT(proc_needed.value)
             ret = RmGetList(session_handle, ctypes.byref(proc_needed), ctypes.byref(proc_count2), proc_info_array, ctypes.byref(reboot_reasons))
             if ret != ERROR_SUCCESS:
@@ -160,6 +161,9 @@ def detect_file_lock(filepath: str):
                     "path": path,
                 })
             return results
+        return []
+    except Exception:
+        traceback.print_exc()
         return []
     finally:
         RmEndSession(session_handle)
