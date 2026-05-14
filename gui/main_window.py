@@ -44,7 +44,9 @@ CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, winty
 CallWindowProcW.restype = ctypes.c_long
 
 # 64 位兼容：使用 SetWindowLongPtrW / GetWindowLongPtrW（在 32 位上回退到 SetWindowLongW）
-_WPARAM_PTR = ctypes.c_ssize_t if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+# c_void_p 在 64 位为 8 字节、32 位为 4 字节，与 LONG_PTR 大小一致，
+# 且是指针类型，满足 ctypes.cast() 要求。
+_WPARAM_PTR = ctypes.c_void_p
 if hasattr(_user32, 'SetWindowLongPtrW'):
     _SetWindowLong = _user32.SetWindowLongPtrW
     _GetWindowLong = _user32.GetWindowLongPtrW
